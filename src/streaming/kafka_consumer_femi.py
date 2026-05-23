@@ -4,15 +4,11 @@ Kafka consumer: analytics
 
 Reads sales messages from a Kafka topic and runs the full pipeline:
   - Validates each message against the data contract
-  - Computes derived fields (subtotal, tax amount, total)
+  - Computes derived fields such as subtotal, tax amount, and total
+  - Flags high-tax orders
+  - Tracks which regions are generating the most sales in real time
 
-Start with main() at the bottom.
-Work up to see how it all fits together.
-
-Many functions are standard helpers
-and should not need project-specific modifications.
-
-Author: Oluwafemi Salawu
+Author: O S
 Date: 2026-05
 
 Terminal command to run this file from the root project folder:
@@ -67,18 +63,31 @@ COURSE_NAME: Final[str] = "Streaming Data"
 TIMEOUT_SECONDS: Final[float] = float(os.getenv("CONSUMER_TIMEOUT_SECONDS", "10.0"))
 MAX_MESSAGES: Final[int] = int(os.getenv("CONSUMER_MAX_MESSAGES", "1000"))
 
+# Business rule: tax amounts at or above this value are flagged.
+HIGH_TAX_THRESHOLD: Final[float] = float(os.getenv("HIGH_TAX_THRESHOLD", "10.0"))
+
 # === DECLARE CONSTANT PATHS ===
 
 ROOT_DIR: Final[Path] = Path.cwd()
 DATA_DIR: Final[Path] = ROOT_DIR / "data"
 OUTPUT_DIR: Final[Path] = DATA_DIR / "output"
 
-OUTPUT_CSV: Final[Path] = OUTPUT_DIR / "consumed_sales.csv"
+OUTPUT_CSV: Final[Path] = OUTPUT_DIR / "consumed_sales_femi.csv"
 
 REGIONS_CSV: Final[Path] = DATA_DIR / "regions.csv"
 PRODUCTS_CSV: Final[Path] = DATA_DIR / "products.csv"
 CURRENCIES_CSV: Final[Path] = DATA_DIR / "currencies.csv"
 DISCOUNT_CODES_CSV: Final[Path] = DATA_DIR / "discount_codes.csv"
+
+# Add custom analysis fields to the normal consumed output fields.
+CUSTOM_CONSUMED_FIELDNAMES: Final[list[str]] = [
+    *CONSUMED_FIELDNAMES,
+    "tax_alert",
+    "region_running_sales",
+    "region_order_count",
+    "top_region_so_far",
+    "top_region_sales_so_far",
+]
 
 
 # ==========================================================
@@ -114,6 +123,7 @@ def load_settings() -> KafkaSettings:
     LOG.info(f"KAFKA_GROUP_ID           = {settings.group_id}")
     LOG.info(f"CONSUMER_TIMEOUT_SECONDS = {TIMEOUT_SECONDS}")
     LOG.info(f"CONSUMER_MAX_MESSAGES    = {MAX_MESSAGES}")
+    LOG.info(f"HIGH_TAX_THRESHOLD       = {HIGH_TAX_THRESHOLD}")
     return settings
 
 
@@ -140,7 +150,6 @@ def verify_topic(settings: KafkaSettings) -> None:
     """
     LOG.info("Verifying Kafka topic...")
 
-    # Create an admin client to check if the topic exists and has messages.
     admin = create_admin_client(settings)
 
     topic_exists_already = topic_exists(admin, settings.topic)
@@ -152,15 +161,12 @@ def verify_topic(settings: KafkaSettings) -> None:
 
     LOG.info(f"Topic {settings.topic!r} exists.")
 
-    # Call a function to get count of messages
-    # on the topic before we start consuming
     message_count = get_topic_message_count(admin, settings.topic, settings)
 
     LOG.info(f"Found {message_count} message(s) available.")
 
     if message_count == 0:
         LOG.error("Topic is empty. Run the producer first.")
-        # Exit with a non-zero code to indicate an error.
         raise SystemExit(1)
 
 
@@ -175,9 +181,6 @@ def get_kafka_consumer(settings: KafkaSettings) -> Any:
     LOG.info("Creating Kafka consumer...")
     consumer = create_consumer(settings)
 
-    # call consumer.subscribe() with an on_assign callback
-    # to reset offsets to the beginning
-    # This ensures the example reads all available messages every time it runs.
     consumer.subscribe(
         [settings.topic],
         on_assign=lambda c, partitions: c.assign(
@@ -211,6 +214,7 @@ def initialize_output() -> RunningStats:
 
     if OUTPUT_CSV.exists():
         OUTPUT_CSV.unlink()
+
     LOG.info(f"Output CSV cleared: {OUTPUT_CSV.name}")
 
     return RunningStats()
@@ -223,6 +227,7 @@ def load_reference_data() -> dict[str, float]:
         A dictionary mapping region_id to tax rate as a float.
     """
     LOG.info("Loading enrichment reference data...")
+
     region_lookup: dict[str, float] = {
         region_id: float(tax_rate_pct)
         for region_id, tax_rate_pct in read_csv_as_lookup(
@@ -231,8 +236,69 @@ def load_reference_data() -> dict[str, float]:
             value_field="tax_rate_pct",
         ).items()
     }
+
     LOG.info(f"Found {len(region_lookup)} region tax rates.")
+
     return region_lookup
+
+
+def get_tax_alert(tax_amount: float) -> str:
+    """Classify the tax amount for one order.
+
+    Arguments:
+        tax_amount: The calculated tax amount for the order.
+
+    Returns:
+        A tax alert label.
+    """
+    if tax_amount >= HIGH_TAX_THRESHOLD:
+        return "high_tax"
+
+    return "normal_tax"
+
+
+def update_region_sales(
+    enriched: dict[str, Any],
+    *,
+    region_sales_totals: dict[str, float],
+    region_order_counts: dict[str, int],
+) -> None:
+    """Update running sales totals and order counts by region.
+
+    Arguments:
+        enriched: The enriched sales message.
+        region_sales_totals: Running sales totals by region.
+        region_order_counts: Running order counts by region.
+    """
+    region_id = str(enriched["region_id"])
+    total = float(enriched["total"])
+
+    region_sales_totals[region_id] = region_sales_totals.get(region_id, 0.0) + total
+    region_order_counts[region_id] = region_order_counts.get(region_id, 0) + 1
+
+
+def add_region_insights(
+    enriched: dict[str, Any],
+    *,
+    region_sales_totals: dict[str, float],
+    region_order_counts: dict[str, int],
+) -> None:
+    """Add region-level running insights to one enriched message.
+
+    Arguments:
+        enriched: The enriched sales message.
+        region_sales_totals: Running sales totals by region.
+        region_order_counts: Running order counts by region.
+    """
+    region_id = str(enriched["region_id"])
+
+    top_region_so_far = max(region_sales_totals, key=region_sales_totals.get)
+    top_region_sales_so_far = region_sales_totals[top_region_so_far]
+
+    enriched["region_running_sales"] = round(region_sales_totals[region_id], 2)
+    enriched["region_order_count"] = region_order_counts[region_id]
+    enriched["top_region_so_far"] = top_region_so_far
+    enriched["top_region_sales_so_far"] = round(top_region_sales_so_far, 2)
 
 
 def process_message(
@@ -240,6 +306,8 @@ def process_message(
     *,
     region_lookup: dict[str, float],
     stats: RunningStats,
+    region_sales_totals: dict[str, float],
+    region_order_counts: dict[str, int],
 ) -> dict[str, Any] | None:
     """Process one consumed message.
 
@@ -248,33 +316,60 @@ def process_message(
     Steps:
       - Validate required fields
       - Enrich with derived fields
+      - Add tax alert field
+      - Update running region sales totals
+      - Add real-time regional sales insights
       - Update running statistics
 
     Arguments:
         row: A raw consumed Kafka message row.
         region_lookup: Tax rates by region_id.
         stats: Running statistics accumulator.
+        region_sales_totals: Running sales totals by region.
+        region_order_counts: Running order counts by region.
 
     Returns:
         The enriched row, or None if validation failed.
     """
-    # First, validate the message against the data contract.
-    # If validation fails, return None to indicate the message should be rejected.
     errors = validate_required_fields(record=row, required_fields=SALES_REQUIRED_FIELDS)
     if errors:
         LOG.warning(f"Validation failed for order {row.get('order_id', '?')}")
         LOG.warning(f"errors={errors}")
         return None
 
-    # Then, enrich the message with derived fields.
     enriched = enrich_message(row, region_lookup)
+
+    tax_amount = float(enriched["tax_amount"])
+    total = float(enriched["total"])
+    region_id = str(enriched["region_id"])
+
+    enriched["tax_alert"] = get_tax_alert(tax_amount)
+
+    update_region_sales(
+        enriched,
+        region_sales_totals=region_sales_totals,
+        region_order_counts=region_order_counts,
+    )
+
+    add_region_insights(
+        enriched,
+        region_sales_totals=region_sales_totals,
+        region_order_counts=region_order_counts,
+    )
+
     LOG.info(f"subtotal={enriched['subtotal']}")
     LOG.info(f"tax={enriched['tax_amount']}")
     LOG.info(f"total={enriched['total']}")
-    LOG.info(f"running_total={stats.total + enriched['total']:.2f}")
+    LOG.info(f"tax_alert={enriched['tax_alert']}")
+    LOG.info(f"region={region_id}")
+    LOG.info(f"region_running_sales=${enriched['region_running_sales']:,.2f}")
+    LOG.info(f"region_order_count={enriched['region_order_count']}")
+    LOG.info(f"top_region_so_far={enriched['top_region_so_far']}")
+    LOG.info(f"top_region_sales_so_far=${enriched['top_region_sales_so_far']:,.2f}")
+    LOG.info(f"running_total={stats.total + total:.2f}")
 
-    # Update running statistics with the new total.
-    stats.update(enriched["total"])
+    stats.update(total)
+
     return enriched
 
 
@@ -283,6 +378,8 @@ def consume_messages(
     *,
     region_lookup: dict[str, float],
     stats: RunningStats,
+    region_sales_totals: dict[str, float],
+    region_order_counts: dict[str, int],
 ) -> tuple[int, int]:
     """Consume and process messages from the Kafka topic.
 
@@ -295,6 +392,8 @@ def consume_messages(
         consumer: An open Kafka consumer subscribed to the topic.
         region_lookup: Tax rates by region_id.
         stats: Running statistics accumulator.
+        region_sales_totals: Running sales totals by region.
+        region_order_counts: Running order counts by region.
 
     Returns:
         A tuple of (consumed_count, skipped_count).
@@ -323,6 +422,8 @@ def consume_messages(
             row,
             region_lookup=region_lookup,
             stats=stats,
+            region_sales_totals=region_sales_totals,
+            region_order_counts=region_order_counts,
         )
 
         if enriched is None:
@@ -334,15 +435,22 @@ def consume_messages(
 
         append_csv_row(
             path=OUTPUT_CSV,
-            row={field: enriched.get(field, "") for field in CONSUMED_FIELDNAMES},
-            fieldnames=CONSUMED_FIELDNAMES,
+            row={
+                field: enriched.get(field, "") for field in CUSTOM_CONSUMED_FIELDNAMES
+            },
+            fieldnames=CUSTOM_CONSUMED_FIELDNAMES,
         )
 
         consumed_count += 1
+
         LOG.info("MESSAGE ACCEPTED")
         LOG.info(f"order={enriched['order_id']}")
+        LOG.info(f"region={enriched['region_id']}")
         LOG.info(f"total=${enriched['total']:.2f}")
+        LOG.info(f"tax_alert={enriched['tax_alert']}")
+        LOG.info(f"top_region_so_far={enriched['top_region_so_far']}")
         LOG.info(f"consumed={consumed_count}")
+
         LOG.info("RUNNING STATS")
         LOG.info(f"total_sales=${stats.total:,.2f}")
         LOG.info(f"average=${stats.mean:,.2f}")
@@ -363,11 +471,34 @@ def save_artifacts() -> None:
 # ===========================================================================
 
 
+def log_region_summary(region_sales_totals: dict[str, float]) -> None:
+    """Log sales totals by region.
+
+    Arguments:
+        region_sales_totals: Running sales totals by region.
+    """
+    if not region_sales_totals:
+        LOG.info("No region sales totals to report.")
+        return
+
+    top_region = max(region_sales_totals, key=region_sales_totals.get)
+
+    LOG.info("REGION SALES SUMMARY")
+    for region_id, region_total in sorted(region_sales_totals.items()):
+        LOG.info(f"  {region_id}: ${region_total:,.2f}")
+
+    LOG.info(
+        f"  Top region overall: {top_region} "
+        f"with ${region_sales_totals[top_region]:,.2f}"
+    )
+
+
 def log_summary(
     consumed_count: int,
     skipped_count: int,
     stats: RunningStats,
     settings: KafkaSettings,
+    region_sales_totals: dict[str, float],
 ) -> None:
     """Log final summary statistics."""
     LOG.info("Summary:")
@@ -380,6 +511,8 @@ def log_summary(
         LOG.info(f"  Average sale: ${stats.mean:,.2f}")
         LOG.info(f"  Minimum sale: ${stats.minimum:,.2f}")
         LOG.info(f"  Maximum sale: ${stats.maximum:,.2f}")
+
+    log_region_summary(region_sales_totals)
 
     LOG.info("========================")
     LOG.info("Consumer executed successfully!")
@@ -411,6 +544,9 @@ def main() -> None:
     stats = initialize_output()
     region_lookup = load_reference_data()
 
+    region_sales_totals: dict[str, float] = {}
+    region_order_counts: dict[str, int] = {}
+
     consumed_count = 0
     skipped_count = 0
 
@@ -419,6 +555,8 @@ def main() -> None:
             consumer,
             region_lookup=region_lookup,
             stats=stats,
+            region_sales_totals=region_sales_totals,
+            region_order_counts=region_order_counts,
         )
     finally:
         consumer.close()
@@ -428,7 +566,14 @@ def main() -> None:
     LOG.info("SECTION E. Exit")
     LOG.info("========================")
 
-    log_summary(consumed_count, skipped_count, stats, settings)
+    save_artifacts()
+    log_summary(
+        consumed_count,
+        skipped_count,
+        stats,
+        settings,
+        region_sales_totals,
+    )
 
 
 # === CONDITIONAL EXECUTION GUARD ===
