@@ -8,7 +8,7 @@ Reads sales messages from a Kafka topic and runs the full pipeline:
   - Flags high-tax orders
   - Tracks which regions are generating the most sales in real time
 
-Author: O S
+Author: Oluwafemi Salawu
 Date: 2026-05
 
 Terminal command to run this file from the root project folder:
